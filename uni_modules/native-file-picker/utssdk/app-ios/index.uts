@@ -1,0 +1,152 @@
+import { UTSiOS } from 'DCloudUTSFoundation'
+import {
+	type ChooseNativeSaveDestination,
+	type NativeFilePickerFail,
+	type NativeFilePickerOptions,
+	type NativeFilePickerProgress,
+	type NativeFilePickerSuccess,
+	type NativePickedFile,
+	type NativeSaveDestinationOptions,
+	type NativeUploadFile,
+	type NativeUploadOptions,
+	type NativeUploadProgress,
+	type NativeUploadSuccess,
+	type WriteNativeSavedFile,
+	type WriteNativeSavedFileOptions
+} from '../interface.uts'
+
+@UTSJS.keepAlive
+export function chooseNativeFiles(options: NativeFilePickerOptions): void {
+	const controller = UTSiOS.getCurrentViewController()
+	if (controller == null) {
+		const error: NativeFilePickerFail = { errMsg: '当前页面无法打开系统文件选择器' }
+		options.fail?.(error)
+		return
+	}
+	const maxCount = Math.max(1, options.count ?? 1).toInt()
+	const maxSizeMB = Math.max(1, options.maxSizeMB ?? 50)
+	const maxSizeBytes = (maxSizeMB * 1024 * 1024).toDouble()
+	const destDir = options.destDir ?? ''
+	NativeFilePickerIOS.shared.choose(
+		from = controller,
+		count = maxCount,
+		maxSizeBytes = maxSizeBytes,
+		destDir = destDir,
+		progress = (name: string, index: Int, count: Int, loaded: Double, total: Double, percent: Int): void => {
+			const result: NativeFilePickerProgress = {
+				name,
+				index: Number.from(index),
+				count: Number.from(count),
+				loaded: Number.from(loaded),
+				total: Number.from(total),
+				progress: Number.from(percent)
+			}
+			options.progress?.(result)
+		},
+		completion = (files: Array<NativePickedFileIOS>, message?: string): void => {
+			if (message != null) {
+				const error: NativeFilePickerFail = { errMsg: message }
+				options.fail?.(error)
+				return
+			}
+			const mapped = files.map((file: NativePickedFileIOS): NativePickedFile => ({
+				path: file.path,
+				name: file.name,
+				size: Number.from(file.size),
+				type: file.mimeType
+			}))
+			const result: NativeFilePickerSuccess = { files: mapped }
+			options.success?.(result)
+		}
+	)
+}
+
+export const chooseNativeSaveDestination: ChooseNativeSaveDestination = function (options: NativeSaveDestinationOptions): void {
+	const controller = UTSiOS.getCurrentViewController()
+	if (controller == null) {
+		const error: NativeFilePickerFail = { errMsg: '当前页面无法打开系统保存面板' }
+		options.fail?.(error)
+		return
+	}
+	NativeFilePickerIOS.shared.chooseSaveFolder(
+		from = controller,
+		filename = options.filename,
+		completion = (token: string, filename: string, message?: string): void => {
+			if (message != null) {
+				const error: NativeFilePickerFail = { errMsg: message }
+				options.fail?.(error)
+				return
+			}
+			options.success?.({
+				canceled: token.length == 0,
+				token,
+				filename
+			})
+		}
+	)
+}
+
+export const writeNativeSavedFile: WriteNativeSavedFile = function (options: WriteNativeSavedFileOptions): void {
+	NativeFilePickerIOS.shared.writeSavedFile(
+		token = options.token,
+		sourcePath = options.sourcePath,
+		filename = options.filename,
+		completion = (path: string, message?: string): void => {
+			if (message != null || path.length == 0) {
+				options.fail?.({ errMsg: message ?? '写入所选位置失败' })
+				return
+			}
+			options.success?.({ path })
+		}
+	)
+}
+
+@UTSJS.keepAlive
+export function uploadNativeMultipart(options: NativeUploadOptions): void {
+	const files: Array<NativeUploadFile> = options.files ?? []
+	if (files.length == 0) {
+		const error: NativeFilePickerFail = { errMsg: '请选择上传文件' }
+		options.fail?.(error)
+		return
+	}
+	const filePaths: Array<string> = []
+	const fileFields: Array<string> = []
+	const fileNames: Array<string> = []
+	const fileMimes: Array<string> = []
+	for (let i = 0; i < files.length; i++) {
+		const file = files[i]
+		filePaths.push(file.path)
+		fileFields.push(file.fieldName)
+		fileNames.push(file.name ?? 'file')
+		fileMimes.push(file.mimeType ?? 'application/octet-stream')
+	}
+	NativeUploaderIOS.shared.uploadMultipart(
+		url = options.url,
+		headersJson = options.headersJson ?? '{}',
+		formDataJson = options.formDataJson ?? '{}',
+		filePaths = filePaths,
+		fileFields = fileFields,
+		fileNames = fileNames,
+		fileMimes = fileMimes,
+		progress = (percent: Int, loaded: Double, total: Double): void => {
+			const result: NativeUploadProgress = {
+				progress: Number.from(percent),
+				loaded: Number.from(loaded),
+				total: Number.from(total)
+			}
+			options.progress?.(result)
+		},
+		completion = (statusCode: Int, data: string, message?: string): void => {
+			if (message != null) {
+				const error: NativeFilePickerFail = { errMsg: message }
+				options.fail?.(error)
+				return
+			}
+			const result: NativeUploadSuccess = {
+				statusCode: Number.from(statusCode),
+				data
+			}
+			options.success?.(result)
+		}
+	)
+}

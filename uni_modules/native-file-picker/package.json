@@ -1,0 +1,34 @@
+{
+  "id": "native-file-picker",
+  "displayName": "原生文件选择器",
+  "version": "1.2.3",
+  "description": "使用 Android/iOS 系统文件选择器选择任意文件，并支持下载前选择系统可见的保存位置。",
+  "keywords": ["file", "picker", "android", "ios", "uts"],
+  "engines": {
+    "HBuilderX": "^5.0.0"
+  },
+  "dcloudext": {
+    "type": "uts",
+    "declaration": {
+      "ads": "无",
+      "data": "仅读取用户主动选择的文件并复制到应用文档目录",
+      "permissions": "无额外权限"
+    }
+  },
+  "uni_modules": {
+    "dependencies": [],
+    "encrypt": [],
+    "platforms": {
+      "client": {
+        "Vue": {
+          "vue2": "u",
+          "vue3": "y"
+        },
+        "App": {
+          "app-android": "y",
+          "app-ios": "y"
+        }
+      }
+    }
+  }
+}

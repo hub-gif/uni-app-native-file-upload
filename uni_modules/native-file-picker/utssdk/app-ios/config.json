@@ -1,0 +1,6 @@
+{
+  "deploymentTarget": "12.0",
+  "validArchitectures": [
+    "arm64"
+  ]
+}

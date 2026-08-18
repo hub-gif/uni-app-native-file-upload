@@ -1,0 +1,94 @@
+export type NativePickedFile = {
+	path: string
+	name: string
+	size: number
+	type: string
+}
+
+export type NativeFilePickerSuccess = {
+	files: Array<NativePickedFile>
+}
+
+export type NativeFilePickerProgress = {
+	name: string
+	index: number
+	count: number
+	loaded: number
+	total: number
+	progress: number
+}
+
+export type NativeFilePickerFail = {
+	errMsg: string
+}
+
+export type NativeFilePickerOptions = {
+	count?: number
+	maxSizeMB?: number
+	/** iOS：5+ `_doc` 的本地绝对路径，选中的文件只写到这里。 */
+	destDir?: string
+	success?: (result: NativeFilePickerSuccess) => void
+	fail?: (error: NativeFilePickerFail) => void
+	progress?: (progress: NativeFilePickerProgress) => void
+}
+
+export type ChooseNativeFiles = (options: NativeFilePickerOptions) => void
+
+export type NativeSaveDestination = {
+	canceled: boolean
+	token: string
+	filename: string
+}
+
+export type NativeSaveDestinationOptions = {
+	filename: string
+	mimeType?: string
+	success?: (result: NativeSaveDestination) => void
+	fail?: (error: NativeFilePickerFail) => void
+}
+
+export type ChooseNativeSaveDestination = (options: NativeSaveDestinationOptions) => void
+
+export type NativeSavedFile = {
+	path: string
+}
+
+export type WriteNativeSavedFileOptions = {
+	token: string
+	sourcePath: string
+	filename: string
+	success?: (result: NativeSavedFile) => void
+	fail?: (error: NativeFilePickerFail) => void
+}
+
+export type WriteNativeSavedFile = (options: WriteNativeSavedFileOptions) => void
+
+export type NativeUploadFile = {
+	path: string
+	fieldName: string
+	name?: string
+	mimeType?: string
+}
+
+export type NativeUploadSuccess = {
+	statusCode: number
+	data: string
+}
+
+export type NativeUploadProgress = {
+	progress: number
+	loaded: number
+	total: number
+}
+
+export type NativeUploadOptions = {
+	url: string
+	headersJson?: string
+	formDataJson?: string
+	files: Array<NativeUploadFile>
+	success?: (result: NativeUploadSuccess) => void
+	fail?: (error: NativeFilePickerFail) => void
+	progress?: (progress: NativeUploadProgress) => void
+}
+
+export type UploadNativeMultipart = (options: NativeUploadOptions) => void

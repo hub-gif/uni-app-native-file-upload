@@ -1,0 +1,413 @@
+import Activity from 'android.app.Activity'
+import Intent from 'android.content.Intent'
+import Uri from 'android.net.Uri'
+import OpenableColumns from 'android.provider.OpenableColumns'
+import DocumentsContract from 'android.provider.DocumentsContract'
+import ContentResolver from 'android.content.ContentResolver'
+import Build from 'android.os.Build'
+import File from 'java.io.File'
+import FileInputStream from 'java.io.FileInputStream'
+import BufferedInputStream from 'java.io.BufferedInputStream'
+import BufferedOutputStream from 'java.io.BufferedOutputStream'
+import FileOutputStream from 'java.io.FileOutputStream'
+
+import {
+	type ChooseNativeSaveDestination,
+	type NativeFilePickerFail,
+	type NativeFilePickerOptions,
+	type NativeFilePickerProgress,
+	type NativeFilePickerSuccess,
+	type NativePickedFile,
+	type NativeSaveDestinationOptions,
+	type NativeUploadOptions,
+	type WriteNativeSavedFile,
+	type WriteNativeSavedFileOptions
+} from '../interface.uts'
+
+const REQUEST_CODE: Int = 0x45c1
+const SAVE_REQUEST_CODE: Int = 0x45c2
+let pendingOptions: NativeFilePickerOptions | null = null
+let pendingSaveOptions: NativeSaveDestinationOptions | null = null
+let lastSaveToken = ''
+let lastSaveUri: Uri | null = null
+let resultHandlerInstalled = false
+
+function dispatchSuccess(options: NativeFilePickerOptions, files: Array<NativePickedFile>): void {
+	UTSAndroid.getDispatcher('main').async(function (_) {
+		const result: NativeFilePickerSuccess = { files }
+		options.success?.(result)
+	}, null)
+}
+
+function dispatchFail(options: NativeFilePickerOptions, message: string): void {
+	UTSAndroid.getDispatcher('main').async(function (_) {
+		const result: NativeFilePickerFail = { errMsg: message }
+		options.fail?.(result)
+	}, null)
+}
+
+function dispatchProgress(
+	options: NativeFilePickerOptions,
+	name: string,
+	index: number,
+	count: number,
+	loaded: Long,
+	total: Long
+): void {
+	if (options.progress == null) return
+	const percent = total > 0 ? Math.min(99, Math.floor(loaded.toDouble() * 100 / total.toDouble())) : 0
+	UTSAndroid.getDispatcher('main').async(function (_) {
+		const result: NativeFilePickerProgress = {
+			name,
+			index,
+			count,
+			loaded: loaded.toDouble(),
+			total: total.toDouble(),
+			progress: percent
+		}
+		options.progress?.(result)
+	}, null)
+}
+
+function safeFileName(name: string): string {
+	const cleaned = name.replace(/[\\\/:*?"<>|]/g, '_')
+	return cleaned.length > 0 ? cleaned : `file_${Date.now()}`
+}
+
+function readMeta(resolver: ContentResolver, uri: Uri): NativePickedFile {
+	let name = `file_${Date.now()}`
+	let size: Long = 0
+	let mime = resolver.getType(uri) ?? 'application/octet-stream'
+	const cursor = resolver.query(uri, null, null, null, null)
+	if (cursor != null) {
+		try {
+			if (cursor.moveToFirst()) {
+				const nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+				if (nameIndex >= 0) name = cursor.getString(nameIndex) ?? name
+				const sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
+				if (sizeIndex >= 0 && !cursor.isNull(sizeIndex)) size = cursor.getLong(sizeIndex)
+			}
+		} finally {
+			cursor.close()
+		}
+	}
+	return {
+		path: '',
+		name: safeFileName(name),
+		size: size.toDouble(),
+		type: mime
+	}
+}
+
+function copyToCache(
+	resolver: ContentResolver,
+	cacheRoot: File,
+	uri: Uri,
+	meta: NativePickedFile,
+	options: NativeFilePickerOptions,
+	index: number,
+	count: number,
+	maxBytes: Long
+): NativePickedFile {
+	const cacheDir = new File(cacheRoot, 'native_file_picker')
+	if (!cacheDir.exists()) cacheDir.mkdirs()
+	const outputFile = new File(cacheDir, `${Date.now()}_${index}_${meta.name}`)
+	const rawInput = resolver.openInputStream(uri)
+	if (rawInput == null) throw new Error(`无法读取「${meta.name}」`)
+	const input = new BufferedInputStream(rawInput, 256 * 1024)
+	const output = new BufferedOutputStream(new FileOutputStream(outputFile), 256 * 1024)
+	const buffer = new ByteArray(256 * 1024)
+	let copied: Long = 0
+	let lastPercent = -1
+	try {
+		while (true) {
+			const length = input.read(buffer)
+			if (length < 0) break
+			if (length == 0) continue
+			copied += length.toLong()
+			if (copied > maxBytes) throw new Error(`「${meta.name}」超过 ${options.maxSizeMB ?? 50}MB`)
+			output.write(buffer, 0, length)
+			const total: Long = meta.size > 0 ? meta.size.toLong() : (0 as Number).toLong()
+			const percent = total > 0 ? Math.floor(copied.toDouble() * 100 / total.toDouble()) : 0
+			if (percent != lastPercent) {
+				lastPercent = percent
+				dispatchProgress(options, meta.name, index, count, copied, total)
+			}
+		}
+		output.flush()
+	} catch (error) {
+		outputFile.delete()
+		throw error
+	} finally {
+		try { output.close() } catch (_) {}
+		try { input.close() } catch (_) {}
+	}
+	return {
+		path: outputFile.getAbsolutePath(),
+		name: meta.name,
+		size: copied.toDouble(),
+		type: meta.type
+	}
+}
+
+function collectUris(data: Intent, maxCount: number): Array<Uri> {
+	const uris = new Array<Uri>()
+	const clipData = data.getClipData()
+	if (clipData != null) {
+		const count = Math.min(clipData.getItemCount(), maxCount)
+		for (let i = 0; i < count; i++) uris.push(clipData.getItemAt(i.toInt()).getUri())
+	} else {
+		const uri = data.getData()
+		if (uri != null) uris.push(uri)
+	}
+	return uris
+}
+
+function installResultHandler(): void {
+	if (resultHandlerInstalled) return
+	resultHandlerInstalled = true
+	UTSAndroid.onAppActivityResult((requestCode: Int, resultCode: Int, data ?: Intent) => {
+		if (requestCode == SAVE_REQUEST_CODE) {
+			handleSaveResult(resultCode, data)
+			return
+		}
+		if (requestCode != REQUEST_CODE) return
+		const options = pendingOptions
+		pendingOptions = null
+		if (options == null) return
+		if (resultCode != Activity.RESULT_OK || data == null) {
+			dispatchSuccess(options, [])
+			return
+		}
+		const maxCount = Math.max(1, options.count ?? 1)
+		const maxSizeMB = Math.max(1, options.maxSizeMB ?? 50)
+		const maxBytes: Long = Math.floor(maxSizeMB * 1024 * 1024).toLong()
+		let uris: Array<Uri>
+		try {
+			uris = collectUris(data, maxCount)
+		} catch (error) {
+			dispatchFail(options, `获取所选文件地址失败：${error}`)
+			return
+		}
+		const activity = UTSAndroid.getUniActivity()
+		if (activity == null) {
+			dispatchFail(options, '文件选择完成后页面上下文已失效，请重试')
+			return
+		}
+		const resolver = activity.getContentResolver()
+		const cacheRoot = activity.getCacheDir()
+		UTSAndroid.getDispatcher('io').async(function (_) {
+			const files = new Array<NativePickedFile>()
+			try {
+				for (let i = 0; i < uris.length; i++) {
+					let meta: NativePickedFile
+					try {
+						meta = readMeta(resolver, uris[i])
+					} catch (error) {
+						throw new Error(`读取文件信息失败：${error}`)
+					}
+					if (meta.size > maxBytes.toDouble()) throw new Error(`「${meta.name}」超过 ${maxSizeMB}MB`)
+					try {
+						files.push(copyToCache(resolver, cacheRoot, uris[i], meta, options, i + 1, uris.length, maxBytes))
+					} catch (error) {
+						throw new Error(`准备「${meta.name}」失败：${error}`)
+					}
+				}
+				dispatchSuccess(options, files)
+			} catch (error) {
+				for (let i = 0; i < files.length; i++) new File(files[i].path).delete()
+				const message = error instanceof Error ? error.message : `读取所选文件失败：${error}`
+				dispatchFail(options, message)
+			}
+		}, null)
+	})
+}
+
+@UTSJS.keepAlive
+export function chooseNativeFiles(options: NativeFilePickerOptions): void {
+	if (pendingOptions != null || pendingSaveOptions != null) {
+		dispatchFail(options, '文件选择器正在使用中')
+		return
+	}
+	const activity = UTSAndroid.getUniActivity()
+	if (activity == null) {
+		dispatchFail(options, '当前页面无法打开系统文件选择器')
+		return
+	}
+	installResultHandler()
+	pendingOptions = options
+	try {
+		const intent = new Intent(Intent.ACTION_OPEN_DOCUMENT)
+		intent.addCategory(Intent.CATEGORY_OPENABLE)
+		intent.setType('*/*')
+		intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+		intent.addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+		if ((options.count ?? 1) > 1) intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+		activity.startActivityForResult(intent, REQUEST_CODE)
+	} catch (error) {
+		pendingOptions = null
+		dispatchFail(options, '无法打开系统文件选择器')
+	}
+}
+
+function dispatchSaveSuccess(options: NativeSaveDestinationOptions, canceled: boolean, token: string, filename: string): void {
+	UTSAndroid.getDispatcher('main').async(function (_) {
+		options.success?.({
+			canceled,
+			token,
+			filename
+		})
+	}, null)
+}
+
+function dispatchSaveFail(options: NativeSaveDestinationOptions, message: string): void {
+	UTSAndroid.getDispatcher('main').async(function (_) {
+		const result: NativeFilePickerFail = { errMsg: message }
+		options.fail?.(result)
+	}, null)
+}
+
+function downloadsInitialUri(): Uri {
+	return Uri.parse('content://com.android.externalstorage.documents/document/primary%3ADownload')
+}
+
+function handleSaveResult(resultCode: Int, data ?: Intent): void {
+	const options = pendingSaveOptions
+	pendingSaveOptions = null
+	if (options == null) return
+	if (resultCode != Activity.RESULT_OK || data == null || data.getData() == null) {
+		dispatchSaveSuccess(options, true, '', options.filename)
+		return
+	}
+	const uri = data.getData() as Uri
+	const activity = UTSAndroid.getUniActivity()
+	if (activity != null) {
+		try {
+			activity.getContentResolver().takePersistableUriPermission(
+				uri,
+				Intent.FLAG_GRANT_READ_URI_PERMISSION.or(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+			)
+		} catch (_) {}
+	}
+	const token = `save_${Date.now()}`
+	lastSaveToken = token
+	lastSaveUri = uri
+	dispatchSaveSuccess(options, false, token, options.filename)
+}
+
+function toJavaFilePath(raw: string): string {
+	let path = raw
+	if (path.startsWith('file://')) {
+		const parsed = Uri.parse(path)
+		const decoded = parsed.getPath()
+		if (decoded != null && decoded.length > 0) return decoded
+		path = path.substring(7)
+	}
+	return path
+}
+
+function writeUriFromFile(resolver: ContentResolver, uri: Uri, sourcePath: string): void {
+	const source = new File(toJavaFilePath(sourcePath))
+	if (!source.exists() || !source.isFile()) throw new Error('下载文件已丢失')
+	if (source.length() <= 0) throw new Error('下载文件为空')
+	const rawInput = new FileInputStream(source)
+	let rawOutput = resolver.openOutputStream(uri)
+	if (Build.VERSION.SDK_INT >= 29) {
+		const overwrite = resolver.openOutputStream(uri, 'wt')
+		if (overwrite != null) {
+			if (rawOutput != null) {
+				try { rawOutput.close() } catch (_) {}
+			}
+			rawOutput = overwrite
+		}
+	}
+	if (rawOutput == null) throw new Error('无法写入所选位置')
+	const input = new BufferedInputStream(rawInput, 256 * 1024)
+	const output = new BufferedOutputStream(rawOutput, 256 * 1024)
+	const buffer = new ByteArray(256 * 1024)
+	let copied: Long = 0
+	try {
+		while (true) {
+			const length = input.read(buffer)
+			if (length < 0) break
+			if (length == 0) continue
+			output.write(buffer, 0, length)
+			copied += length.toLong()
+		}
+		output.flush()
+	} finally {
+		try { output.close() } catch (_) {}
+		try { input.close() } catch (_) {}
+	}
+	if (copied <= 0) throw new Error('写入所选位置后文件仍为空')
+}
+
+export const chooseNativeSaveDestination: ChooseNativeSaveDestination = function (options: NativeSaveDestinationOptions): void {
+	if (pendingOptions != null || pendingSaveOptions != null) {
+		dispatchSaveFail(options, '文件选择器正在使用中')
+		return
+	}
+	const activity = UTSAndroid.getUniActivity()
+	if (activity == null) {
+		dispatchSaveFail(options, '当前页面无法打开系统保存面板')
+		return
+	}
+	installResultHandler()
+	pendingSaveOptions = options
+	try {
+		const intent = new Intent(Intent.ACTION_CREATE_DOCUMENT)
+		intent.addCategory(Intent.CATEGORY_OPENABLE)
+		const mime = options.mimeType ?? ''
+		intent.setType(mime.length > 0 ? mime : '*/*')
+		intent.putExtra(Intent.EXTRA_TITLE, safeFileName(options.filename))
+		intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+		intent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+		intent.addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+		if (Build.VERSION.SDK_INT >= 26) {
+			intent.putExtra(DocumentsContract.EXTRA_INITIAL_URI, downloadsInitialUri())
+		}
+		activity.startActivityForResult(intent, SAVE_REQUEST_CODE)
+	} catch (error) {
+		pendingSaveOptions = null
+		dispatchSaveFail(options, '无法打开系统保存面板')
+	}
+}
+
+export const writeNativeSavedFile: WriteNativeSavedFile = function (options: WriteNativeSavedFileOptions): void {
+	const uri = lastSaveToken == options.token ? lastSaveUri : null
+	if (uri == null) {
+		UTSAndroid.getDispatcher('main').async(function (_) {
+			options.fail?.({ errMsg: '保存位置已失效，请重新选择' })
+		}, null)
+		return
+	}
+	const activity = UTSAndroid.getUniActivity()
+	if (activity == null) {
+		UTSAndroid.getDispatcher('main').async(function (_) {
+			options.fail?.({ errMsg: '当前页面无法写入所选位置' })
+		}, null)
+		return
+	}
+	const resolver = activity.getContentResolver()
+	const sourcePath = options.sourcePath
+	UTSAndroid.getDispatcher('io').async(function (unusedIo) {
+		try {
+			writeUriFromFile(resolver, uri, sourcePath)
+			lastSaveToken = ''
+			lastSaveUri = null
+			UTSAndroid.getDispatcher('main').async(function (unusedMain) {
+				options.success?.({ path: uri.toString() })
+			}, null)
+		} catch (error) {
+			const message = error instanceof Error ? error.message : `写入所选位置失败：${error}`
+			UTSAndroid.getDispatcher('main').async(function (unusedFail) {
+				options.fail?.({ errMsg: message })
+			}, null)
+		}
+	}, null)
+}
+
+export function uploadNativeMultipart(options: NativeUploadOptions): void {
+	const error: NativeFilePickerFail = { errMsg: '当前平台请使用应用上传底座' }
+	options.fail?.(error)
+}
